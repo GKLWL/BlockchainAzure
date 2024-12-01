@@ -1,38 +1,3 @@
-<#
-.SYNOPSIS
-    Performs a digital evidence capture operation on a target VM.
-    This script is the optimized version that runs in parallel jobs.
-
-.DESCRIPTION
-    This is sample code, please be sure to read
-    https://docs.microsoft.com/azure/architecture/example-scenario/forensics/ to get
-    all the requirements in place and adapt the code to your environment by replacing
-    the placeholders and adding the required code blocks before using it. Key outputs
-    are in the script for debug reasons, remove the output after the initial tests to
-    improve the security of your script.
-    
-    This is designed to be run from a Windows Hybrid Runbook Worker in response to a
-    digital evidence capture request for a target VM. It will create disk snapshots
-    for all disks (OS and Data Disks), copying them to immutable SOC storage, takes
-    the hash of all disks if specified in the CalculateHash parameter, and stores them
-    in the SOC Key Vault.
-
-    The hash calculation may require a long time to complete, depending on the algorithm 
-    chosen and on the size of the disks. The script will run in parallel jobs (one job 
-    for each disk) to speed up the process. The most performant algorithm is SKEIN because
-    it reads the disk in chunks of 1MB and merges all the hashes calculated for each chunk.
-
-    This script depends on Az.Accounts, Az.Compute, Az.Storage, and Az.KeyVault being 
-    imported in your Azure Automation account and in the Hybrid Runbook Worker.
-    See: https://docs.microsoft.com/en-us/azure/automation/az-modules
-
-.EXAMPLE
-    Copy-VmDigitalEvidence -SubscriptionId ffeeddcc-bbaa-9988-7766-554433221100 -ResourceGroupName rg-finance-vms -VirtualMachineName vm-workstation-001
-
-.LINK
-    https://docs.microsoft.com/azure/architecture/example-scenario/forensics/
-#>
-
 param (
     # The ID of subscription in which the target Virtual Machine is stored
     [Parameter(Mandatory = $true)]
@@ -58,14 +23,38 @@ param (
     [Parameter(Mandatory = $false)]
     [ValidateSet("MD5", "SHA256", "SKEIN", "KECCAK", "SHA3")]
     [string]
-    $HashAlgorithm = "MD5"
+    $HashAlgorithm = "MD5",
+
+    # Log Analytics Workspace of SOC Team
+    [Parameter(Mandatory = $true)]
+    [string]
+    $LogAnalyticsWorkspaceId,  # Log Analytics Workspace ID
+    
+    [Parameter(Mandatory = $true)]
+    [string]
+    $LogAnalyticsWorkspaceKey,  # Log Analytics Workspace Key
+
+    [Parameter(Mandatory = $true)]
+    [string]
+    $blockchainAddress,
+
+    [Parameter(Mandatory = $true)]
+    [string]
+    $privatekey,                #blockchain wallet private key
+
+    [Parameter(Mandatory = $true)]
+    [string]
+    $caseID                #blockchain wallet private key
 )
+
+
 
 #$ErrorActionPreference = 'Stop'
 
 ######################################### CoC Constants ###################################################
 # Update the following Automation Account Variable with the values related to your environment
 
+$autoAcc    = Get-AutomationVariable -Name 'autoAcc'    # The name of automation account being used to
 $destSubId  = Get-AutomationVariable -Name 'destSubId'  # The subscription containing the storage account being copied to (ex. 00112233-4455-6677-8899-aabbccddeeff)
 $destRGName = Get-AutomationVariable -Name 'destRGName' # The name of the resource group containing the storage account being copied to 
 $destSAblob = Get-AutomationVariable -Name 'destSAblob' # The name of the storage account for BLOB
@@ -184,6 +173,39 @@ $KECCAKscriptBlock = {
     return $result
 }
 
+#########################################
+# Blockchain Interaction Constants
+$nodeScriptPath = "C:\Users\cocsocadmin\Downloads\scripts\interact.js" # Path to the Node.js script on the Hybrid Worker
+$nodePath = "C:\Program Files\nodejs\node.exe"
+$env:CONTRACT_ADDRESS=$blockchainAddress
+$env:RPC_URL="http://172.16.0.5:7545"
+$env:PRIVATE_KEY=$privatekey
+$env:SCRIPTPATH = "C:\Users\cocsocadmin\Downloads\scripts\"
+# Function to Call Node.js Script
+function Call-Blockchain {
+    param (
+        [int64]$timestamp,
+        [string]$caseId,
+        [string]$description
+    )
+
+    # Construct Node.js arguments
+    $args = @(
+        "--timestamp", $timestamp,
+        "--caseID", $caseId,
+        "--description", $description
+    )
+
+    # Execute Node.js Script
+    try {
+        Write-Output "Calling blockchain script with arguments: $args"
+        $result = & $nodePath $nodeScriptPath @args
+        Write-Output "Blockchain script result: $result"
+    } catch {
+        Write-Output "Error calling blockchain script: $_"
+    }
+}
+
 # End Script Block Section
 #############################################################################################
 
@@ -211,6 +233,8 @@ if ($bios) {
     Write-Output "Logging in to Azure..."
     Connect-AzAccount -Identity
     Set-AzContext -Subscription $SubscriptionId
+    
+
     ################################## Mounting fileshare #######################################
 
     If (!(Test-Path $targetWindowsDir)) {
@@ -424,7 +448,6 @@ if ($bios) {
     Write-Output "Elapsed time: $($sw.Elapsed.TotalMinutes)  minutes"
     Set-AzContext -Subscription $SubscriptionId
 
-
     #############################
     # CLEANUP SECTION
     #############################
@@ -446,6 +469,47 @@ if ($bios) {
     # Remove the temporary share on the hybrid worker
     Remove-PSDrive -Name Z -Force
 
+    ##############################################
+    #Blockchain Record of Running Runbook
+   
+    Write-Output "Recording running of runbook"
+    $currentJobId = $PSPrivateMetadata.JobId.Guid
+    Write-Output "The current Job ID is: $currentJobId"
+    $currentJob = Get-AzAutomationJob -AutomationAccountName $autoAcc `
+                                  -ResourceGroupName $destRGName `
+                                  -Id $currentJobId    
+    $startTime = $currentJob.StartTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $endTime = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $activityLogs = Get-AzLog -ResourceGroupName $destRGName `
+    -StartTime $startTime `
+    -EndTime $endTime
+    foreach ($log in $activityLogs) {
+        if ($log.OperationName -eq "Create an Azure Automation job"){
+            $logString = $log | Format-List * | Out-String
+            $logHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($logString))) -Algorithm SHA256).hash
+            Write-Output "SHA256 Hash of Log = $logHash"
+            Write-Output "Time: $($log.EventTimestamp), Operation: $($log.OperationName), Caller: $($log.Caller)"
+            $unixTimestamp = [Math]::Floor((Get-Date $log.EventTimestamp -UFormat %s) * 1.0)
+            Write-Output "unix time: $unixTimestamp" 
+            $description = "Operation: $($log.OperationName), Caller: $($log.Caller)"
+            Write-Output "Description: $description"
+            Call-Blockchain -timestamp $unixTimestamp -caseId $caseID -description $description
+
+        }
+    }
+    ##############################################
+    #Blockchain Record Creating Snapshot
+    $startTime = $currentJob.StartTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $endTime = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $activityLogs = Get-AzLog -ResourceGroupName $ResourceGroupName `
+    -StartTime $startTime `
+    -EndTime $endTime
+
+    foreach ($log in $activityLogs) {
+        if ($log.OperationName -eq "Create or Update Snapshot"){
+            Write-Output "Time: $($log.EventTimestamp), Operation: $($log.OperationName), Caller: $($log.Caller)"
+        }
+    }
     #################################
     # FINAL STATUS
     #################################
